@@ -1,0 +1,524 @@
+#!/usr/bin/env bash
+# vim: et fenc=utf-8 nobomb sts=4 sw=4 ts=4
+# § 2024/09/13 ????/??/??
+set -u
+
+
+
+
+DEBUG_STDERR_PATHF= #/absolute/path/stderr.txt
+DEBUG_STDOUT_PATHF= #/absolute/path/stdout.txt
+IPV4= #/absolute/path/ipv4.sh
+IPV6= #/absolute/path/ipv6.sh
+NAMESPACE=
+
+
+
+
+ACTION_ALIASES=('off:down,flush,stop' 'on:start,up' 'reset:reload,restart')
+CODE_BASTION=105
+CODE_DISABLED=100
+CODE_FAIL=103
+CODE_LOCKDOWN=106
+CODE_OFF=104
+CODE_OK=101
+CODE_ON=102
+FLOCK_FD=123
+FLOCK_PATHF='/run/lock/redfox.lock'
+FLOCK_TIMEOUT=0
+TAG='REDFOX_WAS_HERE'
+TAG_BASTION="${TAG}_BASTION"
+TAG_LOCKDOWN="${TAG}_LOCKDOWN"
+
+
+
+
+redfox.action.bastion(){ # 2024/09/13
+    [[ $# -eq 1 ]]         ||  return $CODE_FAIL
+    [[ $1 == @(ip|ip6) ]]  ||  return $CODE_FAIL
+
+    local family=$1
+    local ruleset=
+    local table=$TAG_BASTION
+
+    ruleset+="
+        flush ruleset $family;
+
+        table $family $table {
+                chain INPUT {
+                        type filter hook input priority filter; policy drop;
+                        iifname \"lo\" accept
+                        ct state established,related accept
+                }
+
+                chain OUTPUT {
+                        type filter hook output priority filter; policy accept;
+                }
+        }
+    "
+
+    if [[ $family == 'ip6' ]]; then
+        local ar="add rule $family $table"
+        local as="add set  $family $table"
+
+        ruleset+="
+            $ar INPUT icmpv6 type { nd-neighbor-advert, nd-neighbor-solicit, nd-router-advert } accept
+            $as DHCP { type ifname . ipv6_addr; timeout 1s; }
+            $ar OUTPUT ip6 daddr ff02::1:2 udp sport 546 udp dport 547 set update oifname . ip6 saddr @DHCP
+            $ar INPUT udp sport 547 udp dport 546 iifname . ip6 daddr @DHCP accept
+        "
+    fi
+
+    nft --file - <<< $ruleset  ||  return $CODE_FAIL
+
+    return $CODE_OK
+}
+
+
+
+
+redfox.action.lockdown(){ # 2024/09/13
+    [[ $# -eq 1 ]]         ||  return $CODE_FAIL
+    [[ $1 == @(ip|ip6) ]]  ||  return $CODE_FAIL
+
+    local family=$1
+    local ruleset=
+    local table=$TAG_LOCKDOWN
+
+    ruleset+="
+        flush ruleset $family;
+
+        table $family $table {
+            chain FORWARD { type filter hook forward priority filter; policy drop; }
+            chain INPUT   { type filter hook input   priority filter; policy drop; }
+            chain OUTPUT  { type filter hook output  priority filter; policy drop; }
+        }
+    "
+
+    nft --file - <<< $ruleset  ||  return $CODE_FAIL
+
+    return $CODE_OK
+}
+
+
+
+
+redfox.action.off(){ # 2024/09/12
+    [[ $# -eq 1 ]]         ||  return $CODE_FAIL
+    [[ $1 == @(ip|ip6) ]]  ||  return $CODE_FAIL
+
+    local family=$1
+
+    nft flush ruleset "$family"  ||  return $CODE_FAIL
+
+    return $CODE_OK
+}
+
+
+
+
+redfox.action.on(){ # 2024/09/12
+    [[ $# -eq 1 ]]  ||  return $CODE_FAIL
+
+    local action=
+    local family=$1
+    local ret=$CODE_OK
+
+    if [[ $family == 'ip' ]]  &&  [[ -v IPV4 ]]; then
+        action=$IPV4
+    elif [[ $family == 'ip6' ]]  &&  [[ -v IPV6 ]]; then
+        action=$IPV6
+    else
+        return $CODE_FAIL
+    fi
+
+    if [[ ${action:0:1} == '/' ]]; then
+        [[ -f $action ]]  ||  return $CODE_FAIL
+        [[ -r $action ]]  ||  return $CODE_FAIL
+        [[ -x $action ]]  ||  return $CODE_FAIL
+
+        redfox.tool.build_namespace                                   ||  return $CODE_FAIL
+        redfox.tool.exec_in_namespace nft flush ruleset "$family"     ||  return $CODE_FAIL
+        redfox.tool.exec_in_namespace "$action"                       ||  return $CODE_FAIL
+        redfox.tool.exec_in_namespace nft add table "$family" "$TAG"  ||  return $CODE_FAIL
+        redfox.tool.import_ruleset_from_namespace "$family"           ||  return $CODE_FAIL
+    elif [[ $action == @(bastion|lockdown) ]]; then
+        redfox.action.$action "$family"
+
+        ret=$?
+    elif [[ -z $action ]]; then
+        ret=$CODE_DISABLED
+    else
+        ret=$CODE_FAIL
+    fi
+
+    return $ret
+}
+
+
+
+
+redfox.action.reset(){ # 2024/09/11
+    redfox.action.on "$@"
+
+    return $?
+}
+
+
+
+
+redfox.action.status(){ # 2024/09/12
+    [[ $# -eq 1 ]]         ||  return $CODE_FAIL
+    [[ $1 == @(ip|ip6) ]]  ||  return $CODE_FAIL
+
+    local family=$1
+    local match_line_bastion="table $family $TAG_BASTION"
+    local match_line_lockdown="table $family $TAG_LOCKDOWN"
+    local match_line_on="table $family $TAG"
+    local list=
+
+    list=$(nft list tables "$family")  ||  return $CODE_FAIL
+
+    grep --fixed-strings --line-regexp --quiet -- "$match_line_on"       <<< $list  &&  return $CODE_ON
+    grep --fixed-strings --line-regexp --quiet -- "$match_line_bastion"  <<< $list  &&  return $CODE_BASTION
+    grep --fixed-strings --line-regexp --quiet -- "$match_line_lockdown" <<< $list  &&  return $CODE_LOCKDOWN
+
+    redfox.tool.family_is_enabled "$family"  ||  return $CODE_DISABLED
+
+    return $CODE_OFF
+}
+
+
+
+
+redfox.main(){ # 2024/09/13
+    local color_alert='\e[1;33m'
+    local color_disabled='\e[1;30m'
+    local color_fail='\e[1;31m'
+    local color_ok='\e[1;32m'
+    local color_reset='\e[0m'
+    local families=()
+    local func=
+    local regex_namespace='^[0-9A-Za-z_][0-9A-Za-z_-]*$'
+    local ret=0
+    local usage=false
+
+    if [[ $# -gt 0 ]]; then
+        func=$(redfox.tool.get_action_function "$1")  ||  usage=true
+
+        shift
+    fi
+
+    if [[ $# -gt 0 ]]  &&  [[ $1 =~ ^(both|(ipv?)?(4|6)|none)$ ]]; then
+        [[ $1 == @(*4*|none) ]]  &&  unset IPV6
+        [[ $1 == @(*6*|none) ]]  &&  unset IPV4
+
+        shift
+    fi
+
+    [[ -n $func ]]            ||  usage=true
+    [[ $# -eq 0 ]]            ||  usage=true
+    redfox.tool.user_is_root  ||  usage=true
+
+    if $usage; then
+        redfox.usage
+        return $?
+    fi
+
+    {
+        redfox.tool.mute BOTH flock --exclusive --wait "$FLOCK_TIMEOUT" "$FLOCK_FD"  ||  return 1
+        trap redfox.tool.exit_trap EXIT                                              ||  return 1
+
+        if [[ ! -v NAMESPACE ]]; then
+            NAMESPACE=
+        elif [[ -z $NAMESPACE ]]; then
+            local date=
+            local length=4
+            local random=
+
+            date=$(redfox.tool.mute ERROR date '+%y%m%d%H%M%S')           ||  return 1
+            random=$(redfox.tool.mute ERROR openssl rand -hex "$length")  ||  return 1
+
+            NAMESPACE="redfox-$date-$random"
+        fi
+
+        [[ -z $NAMESPACE ]]  ||  [[ $NAMESPACE =~ $regex_namespace ]]  ||  return 1
+
+        [[ -v IPV4 ]]  &&  families+=('ip')
+        [[ -v IPV6 ]]  &&  families+=('ip6')
+
+        local family=; for family in "${families[@]}"; do
+            local number=$(( ${#family} * 2 ))
+
+            redfox.tool.show "IPv$number ${func##*.}... "
+
+            redfox.tool.mute BOTH "$func" "$family"
+            local code=$?
+
+            if [[ $code == "$CODE_BASTION" ]]; then
+                local color=${color_alert}
+                local text='BASTION'
+            elif [[ $code == "$CODE_DISABLED" ]]; then
+                local color=${color_disabled}
+                local text='DISABLED'
+            elif [[ $code == "$CODE_LOCKDOWN" ]]; then
+                local color=${color_alert}
+                local text='LOCKDOWN'
+            elif [[ $code == "$CODE_FAIL" ]]; then
+                local color=${color_fail}
+                local text='FAIL'
+            elif [[ $code == "$CODE_OFF" ]]; then
+                local color=${color_fail}
+                local text='OFF'
+            elif [[ $code == "$CODE_OK" ]]; then
+                local color=${color_ok}
+                local text='OK'
+            elif [[ $code == "$CODE_ON" ]]; then
+                local color=${color_ok}
+                local text='ON'
+            else
+                local color=${color_fail}
+                local text='?'
+            fi
+
+            [[ $color == "${color_fail}" ]]  &&  (( ret+=$number ))
+
+            if [[ -t 1 ]]; then
+                echo -e "${color}${text}${color_reset}"
+            else
+                redfox.tool.showln "$text"
+            fi
+        done
+
+        return $ret
+    } {FLOCK_FD}> "$FLOCK_PATHF"
+}
+
+
+
+
+redfox.tool.build_namespace(){ # 2024/09/10
+    [[ -n $NAMESPACE ]]                              ||  return 0
+    ! redfox.tool.namespace_exists                   ||  return 0
+    redfox.tool.mute BOTH ip netns add "$NAMESPACE"  ||  return 1
+
+    return 0
+}
+
+
+
+
+redfox.tool.exec_in_namespace(){ # 2024/09/12
+    if [[ -z $NAMESPACE ]]; then
+        "$@"
+
+        return $?
+    elif redfox.tool.namespace_exists; then
+        ip netns exec "$NAMESPACE" "$@"
+
+        return $?
+    else
+        return 1
+    fi
+}
+
+
+
+
+redfox.tool.exit_trap(){ # 2024/09/10
+    local ret=$?
+
+    if redfox.tool.namespace_exists; then
+        redfox.tool.mute BOTH ip netns delete "$NAMESPACE"  ||  ret=1
+    fi
+
+    if [[ -f $FLOCK_PATHF ]]  &&  [[ ! -s $FLOCK_PATHF ]]; then
+        redfox.tool.mute BOTH rm --force -- "$FLOCK_PATHF"  ||  ret=1
+    fi
+
+    exit $ret
+}
+
+
+
+
+redfox.tool.family_is_enabled(){ # 2024/09/09
+    [[ $# -eq 1 ]]  ||  return 1
+
+    local family=$1
+
+    [[ $family == 'ip'  ]]  &&  [[ -v IPV4 ]]  &&  [[ -n $IPV4 ]]  &&  return 0
+    [[ $family == 'ip6' ]]  &&  [[ -v IPV6 ]]  &&  [[ -n $IPV6 ]]  &&  return 0
+
+    return 1
+}
+
+
+
+
+redfox.tool.get_action_function(){ # 2024/09/13
+    local action=
+    local list=
+    local regex_action='^[A-Za-z_][0-9A-Za-z_-]*$'
+    local regex_prefix='^redfox\.action\.'
+
+    if [[ $# -eq 1 ]] && [[ $1 =~ $regex_action ]]; then
+        action=$1
+
+        local i=; for i in "${ACTION_ALIASES[@]}"; do
+            local standard=${i%%:*}
+            local aliases=${i#*:}
+
+            aliases=$(tr ',' $'\n' <<< $aliases)  ||  return 1
+
+            if redfox.tool.mute BOTH grep --fixed-strings --line-regexp --quiet -- "$action" <<< $aliases; then
+                action=$standard
+                break
+            fi
+        done
+    elif [[ $# -ne 0 ]]; then
+        return 1
+    fi
+
+    list=$(redfox.tool.mute ERROR declare -F)                                                              ||  return 1
+    list=$(redfox.tool.mute ERROR cut --delimiter ' ' --fields 3 <<< $list)                                ||  return 1
+    list=$(redfox.tool.mute ERROR grep --extended-regexp "$regex_prefix${regex_action:1:-1}\$" <<< $list)  ||  return 1
+    list=$(redfox.tool.mute ERROR sort <<< $list)                                                          ||  return 1
+
+    if [[ -n $action ]]; then
+        list=$(redfox.tool.mute ERROR grep --extended-regexp --max-count 1 "$regex_prefix$action" <<< $list)  ||  return 1
+    fi
+
+    redfox.tool.showln "$list"
+
+    return 0
+}
+
+
+
+
+redfox.tool.import_ruleset_from_namespace(){ # 2024/09/13
+    [[ $# -eq 1 ]]       ||  return 1
+    [[ -n $NAMESPACE ]]  ||  return 0
+
+    local family=$1
+    local ruleset="flush ruleset $family;"$'\n'
+
+    ruleset+=$(redfox.tool.mute ERROR redfox.tool.exec_in_namespace nft list ruleset "$family")  ||  return 1
+
+    nft --file - <<< $ruleset  ||  return 1
+
+    return 0
+}
+
+
+
+
+redfox.tool.mute(){ # 2024/09/12
+    [[ $# -ge 2 ]]  ||  return 1
+
+    local _redir_devnull='/dev/null'
+    local _redir_stderr=$DEBUG_STDERR_PATHF
+    local _redir_stdout=$DEBUG_STDOUT_PATHF
+
+    [[ -z $_redir_stderr ]]  &&  _redir_stderr=$_redir_devnull
+    [[ -z $_redir_stdout ]]  &&  _redir_stdout=$_redir_devnull
+
+    if [[ $1 == 'BOTH' ]]; then
+        "${@:2}" 1>> "$_redir_stdout" 2>> "$_redir_stderr"
+    elif [[ $1 == 'ERROR' ]]; then
+        "${@:2}" 2>> "$_redir_stderr"
+    elif [[ $1 == 'NONE' ]]; then
+        "${@:2}"
+    elif [[ $1 == 'NULL' ]]; then
+        "${@:2}" &> "$_redir_devnull"
+    elif [[ $1 == 'OUT' ]]; then
+        "${@:2}" 1>> "$_redir_stdout"
+    else
+        return 1
+    fi
+
+    return $?
+}
+
+
+
+
+redfox.tool.namespace_exists(){ # 2024/09/12
+    [[ -n $NAMESPACE ]]  ||  return 1
+
+    local list=
+
+    list=$(redfox.tool.mute ERROR ip netns list "$NAMESPACE")                                            ||  return 1
+    list=$(redfox.tool.mute ERROR grep --fixed-strings --line-regexp --quiet -- "$NAMESPACE" <<< $list)  ||  return 1
+
+    return 0
+}
+
+
+
+
+redfox.tool.show(){ # 2024/09/12
+    if [[ $# -eq 0 ]]; then
+        redfox.tool.mute ERROR echo -n  ||  return 1
+    elif [[ $# -eq 1 ]]; then
+        redfox.tool.mute ERROR printf -- '%s' "$1"  ||  return 1
+    else
+        return 1
+    fi
+
+    return 0
+}
+
+
+
+
+redfox.tool.showln(){ # 2024/09/08
+    local eol=$'\n'
+
+    [[ $# -eq 0 ]]  &&  set -- ''
+    [[ $# -eq 1 ]]  &&  set -- "$1$eol"
+
+    redfox.tool.show "$@"
+
+    return $?
+}
+
+
+
+
+redfox.tool.user_is_root(){ # 2024/09/09
+    local regex_uid='^(0|[1-9][0-9]*)$'
+    local uid=
+
+    uid=$(redfox.tool.mute ERROR id --user)  ||  return 1
+    [[ $uid =~ $regex_uid ]]                 ||  return 1
+    [[ $uid -eq 0 ]]                         ||  return 1
+
+    return 0
+}
+
+
+
+
+redfox.usage(){ # 2024/09/13
+    local list=
+    local ret=1
+
+    list=$(redfox.tool.get_action_function)                                  ||  return $ret
+    list=$(redfox.tool.mute ERROR cut --delimiter '.' --fields 3 <<< $list)  ||  return $ret
+    list=$(redfox.tool.mute ERROR sort <<< $list)                            ||  return $ret
+    list=$(redfox.tool.mute ERROR tr '\n' '|' <<< "$list")                   ||  return $ret
+
+    list=${list:0:-1} # "bar|foo|" ---> "bar|foo"
+
+    redfox.tool.showln "usage as root: $list [4|6|ip4|ip6|ipv4|ipv6|both|none]"
+
+    return $ret
+}
+
+
+
+
+redfox.main "$@"
+exit $?
